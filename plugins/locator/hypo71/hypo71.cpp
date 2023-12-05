@@ -26,6 +26,7 @@
 
 #include <seiscomp/core/system.h>
 #include <seiscomp/logging/log.h>
+#include <seiscomp/logging/filerotator.h>
 #include <seiscomp/core/strings.h>
 #include <seiscomp/system/environment.h>
 #include <seiscomp/datamodel/utils.h>
@@ -34,6 +35,7 @@
 #include <seiscomp/math/vector3.h>
 #include <seiscomp/utils/files.h>
 
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -81,6 +83,34 @@ const string genRandomString(const size_t& length) {
 	return alpha;
 }
 
+
+class LogOutput : public Logging::FileRotatorOutput {
+	public:
+		LogOutput() {
+			logComponent(false);
+			logContext(false);
+		}
+
+	public:
+		void publish(const string &msg) {
+			publish_(msg);
+		}
+
+		template <typename S, typename... Args>
+		void publish(const S &format, Args &&...args) {
+			publish_(Core::stringify(format, args...));
+		}
+
+	private:
+		void publish_(const string &msg) {
+			log("log", Logging::LL_INFO, msg.c_str(), time(0));
+		}
+};
+
+
+#define HYPO71_LOG(...) static_cast<LogOutput*>(_logOutput)->publish(__VA_ARGS__)
+
+
 }
 // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
@@ -93,7 +123,6 @@ Hypo71::IDList Hypo71::_allowedParameters;
 
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 Hypo71::Hypo71() {
-
 	_name = "Hypo71";
 	_publicIDPattern = "Hypo71.@time/%Y%m%d%H%M%S.%f@.@id@";
 	_allowMissingStations = false;
@@ -133,7 +162,11 @@ Hypo71::Hypo71() {
 
 
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-Hypo71::~Hypo71() {}
+Hypo71::~Hypo71() {
+	if ( _logOutput ) {
+		delete _logOutput;
+	}
+}
 // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 
@@ -163,16 +196,30 @@ bool Hypo71::init(const Config::Config& config) {
 	}
 
 	Seiscomp::Environment *env = Seiscomp::Environment::Instance();
+	string logFileName;
 
 	try {
-		_logFile = env->absolutePath(config.getString("hypo71.logFile"));
-		SEISCOMP_DEBUG("%s | logFile              | %s", MSG_HEADER, _logFile.c_str());
+		logFileName = env->absolutePath(config.getString("hypo71.logFile"));
+		SEISCOMP_DEBUG("%s | logFile              | %s", MSG_HEADER, logFileName.c_str());
 	}
 	catch ( ... ) {
-		_logFile = env->absolutePath("@DATADIR@/hypo71/HYPO71.LOG");
+		logFileName = env->absolutePath("@LOGDIR@/HYPO71.LOG");
 		SEISCOMP_DEBUG("%s |   logFile            | DEFAULT value: %s",
-		    MSG_HEADER, _logFile.c_str());
+		    MSG_HEADER, logFileName.c_str());
 	}
+
+	if ( _logOutput ) {
+		delete _logOutput;
+	}
+
+	auto logFile = new LogOutput();
+	if ( !logFile->open(logFileName.c_str()) ) {
+		SEISCOMP_WARNING("Failed to open log file at %s", logFileName.c_str());
+		delete logFile;
+		logFile = nullptr;
+	}
+
+	_logOutput = logFile;
 
 	try {
 		_h71inputFile = env->absolutePath(config.getString("hypo71.inputFile"));
@@ -821,17 +868,6 @@ const int Hypo71::getH71Weight(const PickList& pickList,
 
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 Origin* Hypo71::locate(PickList& pickList) {
-
-	ofstream log(_logFile.c_str(), ios::app);
-
-	/* time log's buffer */
-	time_t rawtime;
-	struct tm* timeinfo;
-	char head[80];
-	time(&rawtime);
-	timeinfo = localtime(&rawtime);
-	strftime(head, 80, "%F %H:%M:%S [log] ", timeinfo);
-
 	//! Reset trial hypocenter position
 	_trialLatDeg = "";
 	_trialLatMin = "";
@@ -1439,7 +1475,7 @@ Origin* Hypo71::locate(PickList& pickList) {
 		    pick->waveformID().stationCode());
 
 		char buffer[10];
-		double pmin, psec, ssec;
+		double pmin, psec, ssec, ptime;
 
 		if ( pick->phaseHint().code().find("P") != string::npos ) {
 
@@ -1456,49 +1492,56 @@ Origin* Hypo71::locate(PickList& pickList) {
 				double newmin = (pmin / 60) - (int) (sharedTime / 3600) * 60;
 				pMinute = toString((int) newmin);
 
-				psec = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "P", 0) - pmin;
-				if ( psec > 99.99 )
-					sprintf(buffer, "%#03.1f", ssec);
-				else
-					sprintf(buffer, "%#02.2f", psec);
-				pSec = toString(buffer);
 
-				pPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(),
-				    pick->waveformID().stationCode(), "P");
-
-				try {
-					if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
-						h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", uncertaintyList));
-					}
-					else
-						h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", maxUncertainty));
-				}
-				catch ( ... ) {
-					h71PWeight = maxWeight;
-				}
-
-				ssec = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "S", 0) - pmin;
-				if ( ssec > 0. ) {
-					//! if ssec > 99.99 then it won't fit into a F5.2 so we convert it into a F5.1
-					if ( ssec > 99.99 )
+				ptime = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "P", 0);
+				if ( ptime != -1 ) {
+					psec = ptime - pmin;
+					if ( psec > 99.99 )
 						sprintf(buffer, "%#03.1f", ssec);
 					else
-						sprintf(buffer, "%#02.2f", ssec);
-					sSec = toString(buffer);
+						sprintf(buffer, "%#02.2f", psec);
+					pSec = toString(buffer);
 
-					sPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(),
-					    pick->waveformID().stationCode(), "S");
+					pPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(),
+					    pick->waveformID().stationCode(), "P");
 
-					isSPhase = true;
 					try {
 						if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
-							h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", uncertaintyList));
+							h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", uncertaintyList));
 						}
 						else
-							h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", maxUncertainty));
+							h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", maxUncertainty));
 					}
 					catch ( ... ) {
-						h71SWeight = maxWeight;
+						h71PWeight = maxWeight;
+					}
+				}
+
+				ptime = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "S", 0);
+				if ( ptime != -1 ) {
+					ssec = ptime - pmin;
+					if ( ssec > 0. ) {
+						//! if ssec > 99.99 then it won't fit into a F5.2 so we convert it into a F5.1
+						if ( ssec > 99.99 )
+							sprintf(buffer, "%#03.1f", ssec);
+						else
+							sprintf(buffer, "%#02.2f", ssec);
+						sSec = toString(buffer);
+
+						sPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(),
+						    pick->waveformID().stationCode(), "S");
+
+						isSPhase = true;
+						try {
+							if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
+								h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", uncertaintyList));
+							}
+							else
+								h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", maxUncertainty));
+						}
+						catch ( ... ) {
+							h71SWeight = maxWeight;
+						}
 					}
 				}
 			}
@@ -1791,7 +1834,7 @@ Origin* Hypo71::locate(PickList& pickList) {
 	OriginQuality oq;
 
 	// Pick indexer
-	int idx = 1;
+	int idx = 0;
 	//int phaseAssocCount = 0;
 	int usedAssocCount = 0;
 	int depthPhaseCount = 0;
@@ -1809,7 +1852,7 @@ Origin* Hypo71::locate(PickList& pickList) {
 		if ( loop == event ) {
 
 			string year, month, day, tHour, tMin, tSec, latDeg, latMin,
-			        lonDeg, lonMin, depth, orms, erh, erz, nbStations, tLat,
+			        lonDeg, lonMin, depth, orms, erh, erz, nbPhases, tLat,
 			        tLon, quality;
 
 			try {
@@ -1927,11 +1970,11 @@ Origin* Hypo71::locate(PickList& pickList) {
 				SEISCOMP_ERROR("quality exception: %s", e.what());
 			}
 			try {
-				nbStations = lineContent.substr(51, 3);
-				nbStations = stripSpace(nbStations);
+				nbPhases = lineContent.substr(51, 3);
+				nbPhases = stripSpace(nbPhases);
 			}
 			catch ( exception& e ) {
-				SEISCOMP_ERROR("nbStations exception: %s", e.what());
+				SEISCOMP_ERROR("nbPhases exception: %s", e.what());
 			}
 
 			tLat = SexagesimalToDecimalHypo71(toDouble(latDeg), toDouble(latMin), latSit);
@@ -1973,7 +2016,6 @@ Origin* Hypo71::locate(PickList& pickList) {
 			_usingFixedDepth = false;
 
 			// Set origin quality
-			oq.setUsedStationCount(toInt(nbStations));
 			oq.setAzimuthalGap(toDouble(gap));
 			oq.setGroundTruthLevel(quality);
 
@@ -1989,7 +2031,7 @@ Origin* Hypo71::locate(PickList& pickList) {
 				SEISCOMP_DEBUG("%s | Depth             | %skm", MSG_HEADER, depth.c_str());
 				SEISCOMP_DEBUG("%s | RMS               | %s", MSG_HEADER, orms.c_str());
 				SEISCOMP_DEBUG("%s | Azimuthal GAP     | %s°", MSG_HEADER, gap.c_str());
-				SEISCOMP_DEBUG("%s | Phases            | %s", MSG_HEADER, nbStations.c_str());
+				SEISCOMP_DEBUG("%s | Phases            | %s", MSG_HEADER, nbPhases.c_str());
 				if ( stringIsOfType(erh, stInteger) )
 					SEISCOMP_DEBUG("%s | ERH               | %s", MSG_HEADER, erh.c_str());
 				if ( stringIsOfType(erz, stInteger) )
@@ -1998,20 +2040,23 @@ Origin* Hypo71::locate(PickList& pickList) {
 			}
 
 			//log << head << "*---------------------------------------*" <<endl;
-			log << head << "|           FINAL RUN RESULTS           |" << endl;
-			log << head << "*---------------------------------------*" << endl;
-			log << head << "|       DATE: " << year << "-" << month << "-" << day << endl;
-			log << head << "|       TIME: " << tHour << ":" << tMin << ":" << tSec << endl;
-			log << head << "|   LATITUDE: " << tLat << endl;
-			log << head << "|  LONGITUDE: " << tLon << endl;
-			log << head << "|      DEPTH: " << depth << endl;
-			log << head << "|        RMS: " << orms << endl;
-			log << head << "|    AZ. GAP: " << gap << endl;
-			if ( stringIsOfType(erh, stInteger) )
-				log << head << "|        ERH: " << erh << endl;
-			if ( stringIsOfType(erz, stInteger) )
-				log << head << "|        ERZ: " << erz << endl;
-			log << head << "*---------------------------------------*" << endl;
+
+			HYPO71_LOG("|           FINAL RUN RESULTS           |");
+			HYPO71_LOG("*---------------------------------------*");
+			HYPO71_LOG("|       DATE: %s-%s-%s", year.c_str(), month.c_str(), day.c_str());
+			HYPO71_LOG("|       TIME: %s:%s:%s", tHour.c_str(), tMin.c_str(), tSec.c_str());
+			HYPO71_LOG("|   LATITUDE: %s", tLat.c_str());
+			HYPO71_LOG("|  LONGITUDE: %s", tLon.c_str());
+			HYPO71_LOG("|      DEPTH: %s", depth.c_str());
+			HYPO71_LOG("|        RMS: %s", orms.c_str());
+			HYPO71_LOG("|    AZ. GAP: %s", gap.c_str());
+			if ( stringIsOfType(erh, stInteger) ) {
+				HYPO71_LOG("|        ERH: %s", erh.c_str());
+			}
+			if ( stringIsOfType(erz, stInteger) ) {
+				HYPO71_LOG("|        ERZ: %s", erz.c_str());
+			}
+			HYPO71_LOG("*---------------------------------------*");
 
 
 		} // loop==event
@@ -2242,6 +2287,15 @@ Origin* Hypo71::locate(PickList& pickList) {
 	if ( hrms >= 0 )
 		oq.setStandardError(hrms);
 
+	// Find the number of used stations
+	// by creating a set, build by unique network.station codes of the picks
+	set<string> stations;
+	for ( const auto &pickItem : pickList ) {
+		stations.insert(pickItem.pick->waveformID().networkCode() + "." +
+		                pickItem.pick->waveformID().stationCode());
+	}
+	oq.setUsedStationCount(stations.size());
+
 	if ( !Tdist.empty() ) {
 		sort(Tdist.begin(), Tdist.end());
 		oq.setMinimumDistance(Math::Geo::km2deg(Tdist.front()));
@@ -2250,8 +2304,6 @@ Origin* Hypo71::locate(PickList& pickList) {
 	}
 
 	origin->setQuality(oq);
-
-	log.close();
 
 	return origin;
 }
@@ -2270,21 +2322,12 @@ Hypo71::getZTR(const PickList& pickList) {
 	double minER = 10000.;
 	string minDepth;
 	char buf[10];
-	ofstream log(_logFile.c_str(), ios::app);
 
-	/* time log's buffer */
-	time_t rawtime;
-	struct tm* timeinfo;
-	char head[80];
-	time(&rawtime);
-	timeinfo = localtime(&rawtime);
-	strftime(head, 80, "%F %H:%M:%S [log] ", timeinfo);
-
-	log << endl;
-	log << endl;
-	log << head << "*---------------------------------------*" << endl;
-	log << head << "|           NEW LOCALIZATION            |" << endl;
-	log << head << "*---------------------------------------*" << endl;
+	HYPO71_LOG("");
+	HYPO71_LOG("");
+	HYPO71_LOG("*---------------------------------------*");
+	HYPO71_LOG("|           NEW LOCALIZATION            |");
+	HYPO71_LOG("*---------------------------------------*");
 
 
 	/*----------------------------------*
@@ -2433,15 +2476,15 @@ Hypo71::getZTR(const PickList& pickList) {
 	cIC.zres = dIC.zres;
 
 
-	log << head << "| Picklist content" << endl;
+	HYPO71_LOG("| Picklist content");
 	for (PickList::const_iterator i = pickList.begin();
 	        i != pickList.end(); ++i) {
 		PickPtr p = i->pick;
-		log << head << "|  " << p->phaseHint().code() << " "
-		    << p->waveformID().stationCode() << " a.k.a. "
-		    << getStationMappedCode(p->waveformID().networkCode(), p->waveformID().stationCode())
-		    << " " << p->time().value().toString("%H:%M:%S.%f")
-		    << endl;
+		HYPO71_LOG("|  %s %s a.k.a. %s %s",
+		             p->phaseHint().code().c_str(),
+		             p->waveformID().stationCode().c_str(),
+		             getStationMappedCode(p->waveformID().networkCode(), p->waveformID().stationCode()).c_str(),
+		             p->time().value().toString("%H:%M:%S.%f").c_str());
 	}
 
 
@@ -2453,9 +2496,9 @@ Hypo71::getZTR(const PickList& pickList) {
 
 		ofstream h71in(_h71inputFile.c_str());
 
-		log << head << "*---------------------------------------*" << endl;
-		log << head << "| " << "ITERATION " << j << " with ZTR fixed at "
-		        << stripSpace(Tztr.at(j)) << "km" << endl;
+		HYPO71_LOG("*---------------------------------------*");
+		HYPO71_LOG("| ITERATION %zu with ZTR fixed at %skm",
+		             j, stripSpace(Tztr.at(j)).c_str());
 
 		/*-----------------------*/
 		/*| HYPO71 HEADING CARD |*/
@@ -2751,7 +2794,7 @@ Hypo71::getZTR(const PickList& pickList) {
 			string stationMappedName = getStationMappedCode(pick->waveformID().networkCode(),
 			    pick->waveformID().stationCode());
 			char buffer[10];
-			double pmin, psec, ssec;
+			double pmin, psec, ssec, ptime;
 
 			string tmpDate = pick->time().value().toString("%Y").substr(2, 2)
 			        + pick->time().value().toString("%m") + pick->time().value().toString("%d");
@@ -2772,46 +2815,51 @@ Hypo71::getZTR(const PickList& pickList) {
 					double newmin = pmin / 60 - (int) (sharedTime / 3600) * 60;
 					pMinute = toString((int) newmin);
 
-					psec = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "P", 0) - pmin;
-					pPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(), staName, "P");
-					if ( psec > 99.99 )
-						sprintf(buffer, "%#03.1f", ssec);
-					else
-						sprintf(buffer, "%#02.2f", psec);
-					pSec = toString(buffer);
-
-					try {
-						if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
-							h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", uncertaintyList));
-						}
-						else
-							h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", maxUncertainty));
-					}
-					catch ( ... ) {
-						h71PWeight = maxWeight;
-					}
-
-					ssec = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "S", 0) - pmin;
-
-					if ( ssec > 0. ) {
-						// If ssec > 99.99 then it won't fit into a F5.2
-						// so we convert it into a F5.1
-						if ( ssec > 99.99 )
+					ptime = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "P", 0);
+					if ( ptime != -1 ) {
+						psec = ptime - pmin;
+						pPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(), staName, "P");
+						if ( psec > 99.99 )
 							sprintf(buffer, "%#03.1f", ssec);
 						else
-							sprintf(buffer, "%#02.2f", ssec);
-						sSec = toString(buffer);
-						sPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(), staName, "S");
-						isSPhase = true;
+							sprintf(buffer, "%#02.2f", psec);
+						pSec = toString(buffer);
+
 						try {
 							if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
-								h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", uncertaintyList));
+								h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", uncertaintyList));
 							}
 							else
-								h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", maxUncertainty));
+								h71PWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "P", maxUncertainty));
 						}
 						catch ( ... ) {
-							h71SWeight = maxWeight;
+							h71PWeight = maxWeight;
+						}
+					}
+
+					ptime = getTimeValue(pickList, pick->waveformID().networkCode(), staName, "S", 0);
+					if ( ptime != -1 ) {
+						ssec = ptime - pmin;
+						if ( ssec > 0. ) {
+							// If ssec > 99.99 then it won't fit into a F5.2
+							// so we convert it into a F5.1
+							if ( ssec > 99.99 )
+								sprintf(buffer, "%#03.1f", ssec);
+							else
+								sprintf(buffer, "%#02.2f", ssec);
+							sSec = toString(buffer);
+							sPolarity = getPickPolarity(pickList, pick->waveformID().networkCode(), staName, "S");
+							isSPhase = true;
+							try {
+								if ( pConfig.readInto(uncertaintyList, "WEIGHT_UNCERTAINTY_BOUNDARIES") ) {
+									h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", uncertaintyList));
+								}
+								else
+									h71SWeight = toString(getH71Weight(pickList, pick->waveformID().networkCode(), staName, "S", maxUncertainty));
+							}
+							catch ( ... ) {
+								h71SWeight = maxWeight;
+							}
 						}
 					}
 				}
@@ -3064,21 +3112,23 @@ Hypo71::getZTR(const PickList& pickList) {
 						else
 							ER = 10000.;
 
-						log << head << "|  RMS: " << formatString(rms, 10, 1) << "  LAT: " << tLat << endl;
-						log << head << "|  ERH: " << formatString(erh, 10, 1) << "  LON: " << tLon << endl;
-						log << head << "|  ERZ: " << formatString(erz, 10, 1) << "DEPTH: " << depth << "km" << endl;
-						log << head << "|   ER: " << ER << endl;
+						HYPO71_LOG("|  RMS: %s  LAT: %s", formatString(rms, 10, 1).c_str(), tLat.c_str());
+						HYPO71_LOG("|  ERH: %s  LON: %s", formatString(erh, 10, 1).c_str(), tLon.c_str());
+						HYPO71_LOG("|  ERZ: %sDEPTH: %skm", formatString(erz, 10, 1).c_str(), depth.c_str());
+						HYPO71_LOG("|   ER: %f", ER);
 
 						if ( (toDouble(rms) < minRMS) or ( (toDouble(rms) == minRMS) and ( ER < minER ) ) ) {
 
-							if ( minDepth == "" )
-								log << head << "|  ZTR set to " << depth << "km" << endl;
-							else
-								log << head << "|  " << minDepth << "km old ZTR is replaced by " << depth << "km" << endl;
+							if ( minDepth == "" ) {
+								HYPO71_LOG("|  ZTR set to %skm", depth.c_str());
+							}
+							else {
+								HYPO71_LOG("|  %skm old ZTR is replaced by %skm", minDepth.c_str(), depth.c_str());
+							}
 							minDepth = depth;
 							minRMS = toDouble(rms);
 							minER = ER;
-							
+
 							_trialLatDeg = latDeg;
 							_trialLatMin = latMin;
 							_trialLonDeg = lonDeg;
@@ -3097,15 +3147,13 @@ Hypo71::getZTR(const PickList& pickList) {
 	sprintf(buf, "%#04.0f", toDouble(minDepth));
 	string fdepth = toString(buf);
 
-	log << head << "*---------------------------------------*" << endl;
-	log << head << "|           ITERATIONS RESULTS          |" << endl;
-	log << head << "*---------------------------------------*" << endl;
-	log << head << "| MIN RMS VALUE: " << minRMS << endl;
-	log << head << "|  MIN ER VALUE: " << minER << endl;
-	log << head << "|  ZTR TO APPLY: " << fdepth << endl;
-	log << head << "*---------------------------------------*" << endl;
-
-	log.close();
+	HYPO71_LOG("*---------------------------------------*");
+	HYPO71_LOG("|           ITERATIONS RESULTS          |");
+	HYPO71_LOG("*---------------------------------------*");
+	HYPO71_LOG("| MIN RMS VALUE: %f", minRMS);
+	HYPO71_LOG("|  MIN ER VALUE: %f", minER);
+	HYPO71_LOG("|  ZTR TO APPLY: %s", fdepth);
+	HYPO71_LOG("*---------------------------------------*");
 
 	return fdepth;
 }
@@ -3407,6 +3455,3 @@ void Hypo71::updateProfile(const string& name) {
 	}
 }
 // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-
-
